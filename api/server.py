@@ -781,6 +781,69 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
 
 
 # ============================================================
+# 文件下载端点
+# ============================================================
+
+from fastapi.responses import FileResponse
+import zipfile
+import tempfile
+
+
+@app.get("/api/projects/{project_id}/download/video")
+async def download_video(project_id: str):
+    """直接下载成品视频文件"""
+    if project_id not in _projects:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    result = _projects[project_id].get("result")
+    if not result:
+        raise HTTPException(status_code=400, detail="项目尚未完成")
+
+    video_path = result.get("final_video", "")
+    if not video_path or not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail=f"视频文件不存在: {video_path}")
+
+    filename = os.path.basename(video_path)
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/api/projects/{project_id}/download/draft")
+async def download_draft(project_id: str):
+    """下载剪映草稿文件夹（打包为 zip）"""
+    if project_id not in _projects:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    result = _projects[project_id].get("result")
+    if not result:
+        raise HTTPException(status_code=400, detail="项目尚未完成")
+
+    draft_dir = result.get("draft_dir", "")
+    if not draft_dir or not os.path.exists(draft_dir):
+        raise HTTPException(status_code=404, detail=f"草稿目录不存在: {draft_dir}")
+
+    # 打包为 zip
+    zip_path = os.path.join(os.path.dirname(draft_dir), "jianying_draft.zip")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(draft_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, os.path.dirname(draft_dir))
+                zf.write(file_path, arcname)
+
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename="jianying_draft.zip",
+        headers={"Content-Disposition": 'attachment; filename="jianying_draft.zip"'}
+    )
+
+
+# ============================================================
 # 启动入口
 # ============================================================
 
