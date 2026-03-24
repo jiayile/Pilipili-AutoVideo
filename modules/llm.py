@@ -37,7 +37,7 @@ class Scene:
     duration: float                    # 秒，由 TTS 时长动态决定
     image_prompt: str                  # 发给 Nano Banana 的生图提示词（英文）
     video_prompt: str                  # 发给 Kling/Seedance 的运动描述（英文）
-    voiceover: str                     # 中文旁白文案（发给 TTS）
+    voiceover: str = ""               # 中文旁白文案（发给 TTS），默认空字符串防止 None 崩溃
     transition: str = "crossfade"      # 转场类型: crossfade / fade / wipe / cut
     camera_motion: str = "static"      # 镜头运动: static / pan_left / pan_right / zoom_in / zoom_out
     style_tags: list = field(default_factory=list)  # 风格标签，用于记忆学习
@@ -45,6 +45,21 @@ class Scene:
     # v2.0 新增
     shot_mode: Optional[ShotMode] = None            # 生成模式（LLM 自动标注）
     character_refs: Optional[list[str]] = None      # 多主体参考图路径列表（Omni image_list）
+
+    def __post_init__(self):
+        # 强制将 None 字段转为安全默认值，防止 LLM/前端传来 null 导致 .strip() 崩溃
+        if self.voiceover is None:
+            self.voiceover = ""
+        if self.image_prompt is None:
+            self.image_prompt = ""
+        if self.video_prompt is None:
+            self.video_prompt = ""
+        if self.transition is None:
+            self.transition = "crossfade"
+        if self.camera_motion is None:
+            self.camera_motion = "static"
+        if self.style_tags is None:
+            self.style_tags = []
 
 
 @dataclass
@@ -664,14 +679,14 @@ def _dict_to_video_script(data: dict, topic: str) -> VideoScript:
     scenes = []
     for s in data.get("scenes", []):
         scene = Scene(
-            scene_id=s.get("scene_id", len(scenes) + 1),
-            duration=float(s.get("duration", 5)),
-            image_prompt=s.get("image_prompt", ""),
-            video_prompt=s.get("video_prompt", ""),
-            voiceover=s.get("voiceover", ""),
-            transition=s.get("transition", "crossfade"),
-            camera_motion=s.get("camera_motion", "static"),
-            style_tags=s.get("style_tags", []),
+            scene_id=s.get("scene_id") or (len(scenes) + 1),
+            duration=float(s.get("duration") or 5),
+            image_prompt=s.get("image_prompt") or "",
+            video_prompt=s.get("video_prompt") or "",
+            voiceover=s.get("voiceover") or "",
+            transition=s.get("transition") or "crossfade",
+            camera_motion=s.get("camera_motion") or "static",
+            style_tags=s.get("style_tags") or [],
             reference_character=s.get("reference_character"),
             shot_mode=s.get("shot_mode"),
             character_refs=s.get("character_refs"),
