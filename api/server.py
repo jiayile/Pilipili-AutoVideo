@@ -549,6 +549,7 @@ async def run_workflow(project_id: str, request: CreateProjectRequest):
             voice_id=request.voice_id,
             characters=script.characters or [],
             config=config,
+            max_concurrent=2,  # 降低并发数，减少 MiniMax RPM 限速
             verbose=True,
         )
 

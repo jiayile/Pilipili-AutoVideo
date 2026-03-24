@@ -29,7 +29,7 @@ from modules.llm import Scene
 
 MINIMAX_TTS_URL = "https://api.minimax.chat/v1/t2a_v2"
 
-# 可用音色列表（部分）
+# 可用音色列表（MiniMax 系统音色，已验证存在）
 VOICE_OPTIONS = {
     # 女声
     "female_shaonv": "female-shaonv",      # 少女音（默认）
@@ -37,12 +37,10 @@ VOICE_OPTIONS = {
     "female_chengshu": "female-chengshu",  # 成熟女声
     "female_tianmei": "female-tianmei",    # 甜美音
     # 男声
-    "male_qinchen": "male-qinchen",        # 亲沉男声
-    "male_badao": "male-badao",            # 霸道男声
-    "male_shaonian": "male-shaonian",      # 少年音
-    # 播音
-    "presenter_male": "presenter_male",    # 男播音员
-    "presenter_female": "presenter_female",# 女播音员
+    "male_qn_qingse": "male-qn-qingse",    # 青涩青年音色
+    "male_qn_jingying": "male-qn-jingying", # 精英青年音色
+    "male_qn_badao": "male-qn-badao",      # 霸道青年音色
+    "male_qn_daxuesheng": "male-qn-daxuesheng", # 青年大学生音色
 }
 
 # 情绪选项
@@ -136,13 +134,31 @@ async def generate_voiceover(
         "Accept-Encoding": "gzip, deflate",  # 禁用 br 编码，避免 aiohttp brotli 解码问题
     }
 
-    async with aiohttp.ClientSession(auto_decompress=True) as session:
-        async with session.post(MINIMAX_TTS_URL, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                raise RuntimeError(f"MiniMax TTS API 错误 {resp.status}: {error_text}")
+    # 请求重试：遇到 RPM/TPM 限速（status_code 1002）时指数退避等待，最多重试 4 次
+    MAX_RETRIES = 4
+    result = None
+    for attempt in range(MAX_RETRIES):
+        async with aiohttp.ClientSession(auto_decompress=True) as session:
+            async with session.post(MINIMAX_TTS_URL, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"MiniMax TTS API 错误 {resp.status}: {error_text}")
+                result = await resp.json()
 
-            result = await resp.json()
+        # 检查是否限速
+        base_resp = result.get("base_resp", {})
+        status_code = base_resp.get("status_code", 0)
+        if status_code in (1002, 1004):  # 1002=RPM限速, 1004=TPM限速
+            wait_sec = 2 ** attempt * 5  # 5s, 10s, 20s, 40s
+            if verbose:
+                print(f"[TTS] Scene {scene.scene_id} 限速 ({base_resp.get('status_msg', '')})，{wait_sec}s 后重试 (attempt {attempt+1}/{MAX_RETRIES})...")
+            await asyncio.sleep(wait_sec)
+            result = None
+            continue
+        break  # 成功或其他错误，退出重试循环
+
+    if result is None:
+        raise RuntimeError(f"MiniMax TTS Scene {scene.scene_id} 重试 {MAX_RETRIES} 次后仍限速，请稍后再试")
 
     # 提取音频数据
     if "data" not in result or "audio" not in result["data"]:
@@ -163,10 +179,10 @@ async def generate_voiceover(
     return output_path, duration
 
 
-# 性别默认音色映射
+# 性别默认音色映射（MiniMax 系统音色，已验证存在）
 DEFAULT_VOICE_BY_GENDER = {
-    "male": "male-qinchen",
-    "female": "female-shaonv",
+    "male": "male-qn-qingse",   # 青涩青年音色
+    "female": "female-shaonv",  # 少女音色
 }
 
 
