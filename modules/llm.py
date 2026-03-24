@@ -440,7 +440,7 @@ async def analyze_reference_video(
                             file_uri=video_file.uri,
                             mime_type=mime_type,
                         ),
-                        types.Part.from_text(VIDEO_ANALYSIS_PROMPT),
+                        types.Part.from_text(text=VIDEO_ANALYSIS_PROMPT),
                     ]
                 )
             ]
