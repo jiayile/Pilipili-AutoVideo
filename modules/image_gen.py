@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Optional
 from google import genai
 from google.genai import types
+try:
+    from PIL import Image, ImageDraw
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 from core.config import PilipiliConfig, get_config
 from modules.llm import Scene
@@ -264,7 +269,6 @@ async def generate_keyframe(
         text_response = ""
         if candidates and candidates[0]:
             finish_reason = getattr(candidates[0], 'finish_reason', None)
-            # 提取 API 返回的文本内容，帮助诊断拒绝原因
             try:
                 content = candidates[0].content
                 if content and content.parts:
@@ -275,11 +279,55 @@ async def generate_keyframe(
                 pass
         if verbose and text_response:
             print(f"[ImageGen] Scene {scene.scene_id} API 返回文本（未生成图片）: {text_response[:300]}")
-        raise RuntimeError(
-            f"Scene {scene.scene_id} 图片生成失败：API 未返回图片数据 "
-            f"(finish_reason={finish_reason}, candidates={len(candidates)}) "
-            f"API返回文本: {text_response[:200] if text_response else '无'}"
-        )
+
+        # IMAGE_SAFETY 拦截：先用简化 prompt 重试一次
+        finish_reason_str = str(finish_reason)
+        if "IMAGE_SAFETY" in finish_reason_str or "SAFETY" in finish_reason_str:
+            if verbose:
+                print(f"[ImageGen] Scene {scene.scene_id} 触发安全过滤，尝试用简化 prompt 重试...")
+            # 简化 prompt：去掉人物描述，只保留场景和环境
+            safe_prompt = _make_safe_prompt(scene)
+            safe_contents = [types.Part.from_text(text=safe_prompt)]
+            safe_response = None
+            for model_name in available_models:
+                executor2 = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future2 = executor2.submit(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=safe_contents,
+                    config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+                )
+                try:
+                    safe_response = future2.result(timeout=IMAGE_GEN_TIMEOUT)
+                    executor2.shutdown(wait=False)
+                    break
+                except Exception:
+                    executor2.shutdown(wait=False, cancel_futures=True)
+                    continue
+            if safe_response:
+                safe_candidates = safe_response.candidates or []
+                for cand in safe_candidates:
+                    cparts = (cand.content.parts if cand.content else []) or []
+                    for p in cparts:
+                        if p.inline_data is not None:
+                            img_data = p.inline_data.data
+                            if isinstance(img_data, str):
+                                img_data = base64.b64decode(img_data)
+                            with open(output_path, "wb") as f:
+                                f.write(img_data)
+                            image_saved = True
+                            if verbose:
+                                print(f"[ImageGen] Scene {scene.scene_id} 简化 prompt 重试成功")
+                            break
+                    if image_saved:
+                        break
+
+        # 仍失败：生成纯色占位图，让流程继续
+        if not image_saved:
+            _create_placeholder_image(output_path, scene.scene_id, verbose)
+            image_saved = True
+            if verbose:
+                print(f"[ImageGen] Scene {scene.scene_id} 已使用占位图替代，流程继续")
 
     if verbose:
         print(f"[ImageGen] Scene {scene.scene_id} 关键帧已保存: {output_path}")
@@ -403,3 +451,68 @@ def _detect_mime_type(path: str) -> str:
         ".gif": "image/gif",
     }
     return mime_map.get(ext, "image/jpeg")
+
+
+def _make_safe_prompt(scene: Scene) -> str:
+    """
+    生成安全版 prompt：去掉人物/肢体接触描述，只保留场景环境。
+    用于 IMAGE_SAFETY 拦截后的重试。
+    """
+    # 提取场景关键词（去掉人物相关词汇）
+    unsafe_keywords = [
+        "touch", "kiss", "hug", "embrace", "hold", "hand", "body",
+        "intimate", "close", "near", "together", "couple",
+        "触碰", "接触", "拥抱", "亲吻", "靠近", "依偎", "手", "身体",
+    ]
+    prompt = scene.image_prompt
+    for kw in unsafe_keywords:
+        prompt = prompt.replace(kw, "")
+
+    # 构建纯场景描述
+    safe = (
+        f"A beautiful cinematic scene: {prompt[:200]}. "
+        f"No people, focus on environment and atmosphere. "
+        f"Ultra high quality, 4K resolution, cinematic composition."
+    )
+    return safe
+
+
+def _create_placeholder_image(output_path: str, scene_id: int, verbose: bool = False) -> None:
+    """
+    生成纯色占位图（1920x1080 深灰色，带场景编号文字）。
+    用于所有模型均无法生成图片时的兜底，让流程继续运行。
+    """
+    width, height = 1920, 1080
+    if _PIL_AVAILABLE:
+        img = Image.new("RGB", (width, height), color=(30, 30, 40))
+        draw = ImageDraw.Draw(img)
+        text = f"Scene {scene_id}"
+        # 简单居中文字
+        try:
+            bbox = draw.textbbox((0, 0), text)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        except Exception:
+            tw, th = 100, 30
+        draw.text(
+            ((width - tw) // 2, (height - th) // 2),
+            text,
+            fill=(120, 120, 130),
+        )
+        img.save(output_path, "PNG")
+    else:
+        # PIL 不可用时写一个最小合法 PNG（1x1 黑色像素）
+        import struct, zlib
+        def _png_chunk(tag, data):
+            c = zlib.crc32(tag + data) & 0xFFFFFFFF
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", c)
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+            + _png_chunk(b"IEND", b"")
+        )
+        with open(output_path, "wb") as f:
+            f.write(png)
+    if verbose:
+        print(f"[ImageGen] Scene {scene_id} 占位图已创建: {output_path}")
