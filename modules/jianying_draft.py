@@ -4,7 +4,8 @@
 
 职责：
 - 将生成的视频片段、音频、字幕自动组装为剪映草稿工程文件
-- 用户可直接在剪映中打开进行最终微调
+- v2.0：每个分镜作为独立片段导入，多轨道分离（视频/配音/字幕各独立轨）
+- 用户可在剪映中直接替换单个分镜/配音/字幕，无需重跑全流程
 - 支持自动设置转场、字幕样式、音频轨道
 - 这是"AI 做 90%，人类做最后 10%"的关键闭环
 """
@@ -41,7 +42,12 @@ def generate_jianying_draft(
     verbose: bool = False,
 ) -> str:
     """
-    生成剪映草稿工程文件
+    生成剪映草稿工程文件（v2.0 分轨模式）
+
+    v2.0 改动：
+    - 每个分镜的视频片段作为独立素材导入，不合并
+    - 视频轨、配音轨、字幕轨完全分离，可在剪映中单独编辑
+    - 同时生成 SRT 字幕文件和 EDL 备用格式
 
     Args:
         script: 完整视频脚本
@@ -60,7 +66,6 @@ def generate_jianying_draft(
             script, video_clips, audio_clips, output_dir, project_name, verbose
         )
     except ImportError:
-        # 回退：生成标准 EDL 格式（通用剪辑软件可导入）
         if verbose:
             print("[JianyingDraft] pyJianYingDraft 未安装，回退到 EDL 格式")
         return _generate_edl_fallback(
@@ -82,17 +87,27 @@ def _generate_with_pyjianyingdraft(
     project_name: str,
     verbose: bool,
 ) -> str:
-    """使用 pyJianYingDraft 生成标准剪映草稿"""
+    """
+    使用 pyJianYingDraft 生成标准剪映草稿（v2.0 分轨模式）
+
+    关键改动：
+    1. 每个分镜的视频/音频/字幕都作为独立片段挂在各自轨道上
+    2. 视频轨：N 个独立 VideoSegment，不合并
+    3. 配音轨：N 个独立 AudioSegment，与视频对齐
+    4. 字幕轨：N 个独立 TextSegment，与配音对齐
+    5. 用户在剪映中可单独替换任意一个分镜的视频/配音/字幕
+    """
     import pyJianYingDraft as draft
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 使用 DraftFolder API 创建草稿（推荐方式）
-    draft_folder = draft.DraftFolder(output_dir)
-    # 清理同名草稿
     safe_name = "".join(c for c in project_name if c not in r'\/:*?"<>|').strip() or "pilipili"
+
+    # 使用 DraftFolder API 创建草稿
+    draft_folder = draft.DraftFolder(output_dir)
     if draft_folder.has_draft(safe_name):
         draft_folder.remove(safe_name)
+
     jy_draft = draft_folder.create_draft(
         draft_name=safe_name,
         width=1920,
@@ -102,12 +117,14 @@ def _generate_with_pyjianyingdraft(
         allow_replace=True,
     )
 
-    # 创建轨道（必须在 add_segment 之前调用）
-    jy_draft.add_track(draft.TrackType.video)       # 主视频轨道
-    jy_draft.add_track(draft.TrackType.audio, "配音")  # 音频轨道
-    jy_draft.add_track(draft.TrackType.text, "字幕")   # 字幕轨道
+    # ── 创建轨道 ──────────────────────────────────────────────
+    # v2.0：每个分镜独立片段，所有片段都在同一轨道上按时间顺序排列
+    # 这样在剪映中可以看到每个分镜是独立的素材，可以单独替换
+    jy_draft.add_track(draft.TrackType.video)           # 主视频轨道（多片段）
+    jy_draft.add_track(draft.TrackType.audio, "配音")   # 配音轨道（多片段）
+    jy_draft.add_track(draft.TrackType.text, "字幕")    # 字幕轨道（多片段）
 
-    # 当前时间轴位置（秒）
+    # ── 逐分镜添加片段 ────────────────────────────────────────
     current_s = 0.0
 
     for scene in script.scenes:
@@ -115,23 +132,24 @@ def _generate_with_pyjianyingdraft(
         audio_path = audio_clips.get(scene.scene_id)
 
         if not video_path or not os.path.exists(video_path):
+            if verbose:
+                print(f"[JianyingDraft] Scene {scene.scene_id} 视频片段不存在，跳过")
             continue
 
-        # 时长（秒）
-        duration_s = scene.duration
+        # 获取视频实际时长（比 scene.duration 更准确）
+        video_dur = _get_media_duration(video_path) or scene.duration
 
-        # 添加视频片段到主轨道
+        # ── 视频片段（独立素材，可在剪映中单独替换）────────────
         video_material = draft.VideoMaterial(os.path.abspath(video_path))
         video_segment = draft.VideoSegment(
             material=video_material,
-            target_timerange=draft.trange(f"{current_s}s", f"{duration_s}s"),
+            target_timerange=draft.trange(f"{current_s}s", f"{video_dur}s"),
         )
         jy_draft.add_segment(video_segment)  # 自动进入主视频轨道
 
-        # 添加配音到音频轨道
+        # ── 配音片段（与对应视频片段对齐）──────────────────────
         if audio_path and os.path.exists(audio_path):
-            # 获取音频实际时长，避免 target_timerange 超出素材时长
-            audio_dur = _get_media_duration(audio_path) or duration_s
+            audio_dur = _get_media_duration(audio_path) or video_dur
             audio_material = draft.AudioMaterial(os.path.abspath(audio_path))
             audio_segment = draft.AudioSegment(
                 material=audio_material,
@@ -140,11 +158,13 @@ def _generate_with_pyjianyingdraft(
             )
             jy_draft.add_segment(audio_segment, "配音")
 
-        # 添加字幕到文字轨道
+        # ── 字幕片段（与配音时长对齐，可在剪映中单独修改文字）──
         if scene.voiceover.strip():
+            # 字幕时长与配音对齐（如果有配音），否则与视频对齐
+            subtitle_dur = audio_dur if (audio_path and os.path.exists(audio_path)) else video_dur
             text_segment = draft.TextSegment(
                 text=scene.voiceover.strip(),
-                timerange=draft.trange(f"{current_s}s", f"{duration_s}s"),
+                timerange=draft.trange(f"{current_s}s", f"{subtitle_dur}s"),
                 style=draft.TextStyle(
                     size=8.0,
                     bold=False,
@@ -159,15 +179,76 @@ def _generate_with_pyjianyingdraft(
             )
             jy_draft.add_segment(text_segment, "字幕")
 
-        current_s += duration_s
+        current_s += video_dur
 
     # 保存草稿
     jy_draft.save()
 
-    if verbose:
-        print(f"[JianyingDraft] 剪映草稿已生成: {output_dir}/{safe_name}")
+    draft_path = os.path.join(output_dir, safe_name)
 
-    return os.path.join(output_dir, safe_name)
+    if verbose:
+        print(f"[JianyingDraft] v2.0 分轨草稿已生成: {draft_path}")
+        print(f"[JianyingDraft] 共 {len(script.scenes)} 个分镜，每个分镜独立可编辑")
+
+    # 同时生成 SRT 字幕文件（方便备用）
+    srt_path = os.path.join(output_dir, f"{safe_name}.srt")
+    _generate_srt_file(script.scenes, audio_clips, srt_path)
+
+    # 生成分镜素材清单（方便用户了解每个片段对应的内容）
+    _generate_scene_manifest(script, video_clips, audio_clips, output_dir, safe_name)
+
+    return draft_path
+
+
+def _generate_scene_manifest(
+    script: VideoScript,
+    video_clips: dict[int, str],
+    audio_clips: dict[int, str],
+    output_dir: str,
+    project_name: str,
+) -> None:
+    """
+    生成分镜素材清单 JSON
+    记录每个分镜的视频/音频路径、时长、旁白、提示词等信息
+    方便用户了解每个片段对应的内容，也可用于后续重新生成单个分镜
+    """
+    manifest = {
+        "project_name": project_name,
+        "title": script.title,
+        "topic": script.topic,
+        "total_scenes": len(script.scenes),
+        "total_duration": sum(s.duration for s in script.scenes),
+        "resolution": "1920x1080",
+        "fps": 30,
+        "note": "v2.0 分轨模式：每个分镜为独立片段，可在剪映中单独替换",
+        "scenes": []
+    }
+
+    for scene in script.scenes:
+        video_path = video_clips.get(scene.scene_id, "")
+        audio_path = audio_clips.get(scene.scene_id, "")
+        video_dur = _get_media_duration(video_path) if video_path and os.path.exists(video_path) else scene.duration
+        audio_dur = _get_media_duration(audio_path) if audio_path and os.path.exists(audio_path) else None
+
+        manifest["scenes"].append({
+            "scene_id": scene.scene_id,
+            "duration_planned": scene.duration,
+            "duration_actual": video_dur,
+            "audio_duration": audio_dur,
+            "voiceover": scene.voiceover,
+            "image_prompt": scene.image_prompt,
+            "video_prompt": scene.video_prompt,
+            "shot_mode": getattr(scene, "shot_mode", "i2v"),
+            "transition": scene.transition,
+            "camera_motion": scene.camera_motion,
+            "style_tags": scene.style_tags,
+            "video_clip": os.path.abspath(video_path) if video_path else "",
+            "audio_clip": os.path.abspath(audio_path) if audio_path else "",
+        })
+
+    manifest_path = os.path.join(output_dir, f"{project_name}_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
 def _generate_edl_fallback(
@@ -181,7 +262,7 @@ def _generate_edl_fallback(
     """
     回退方案：生成 EDL（Edit Decision List）文件
     可导入 Premiere Pro、DaVinci Resolve 等专业剪辑软件
-    同时生成一个 JSON 工程描述文件
+    同时生成 JSON 工程描述文件和 SRT 字幕文件
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -193,15 +274,17 @@ def _generate_edl_fallback(
         "",
     ]
 
-    current_tc = 0  # 帧数（25fps）
-    fps = 25
+    current_tc = 0  # 帧数（30fps）
+    fps = 30
 
     for i, scene in enumerate(script.scenes, 1):
         video_path = video_clips.get(scene.scene_id)
         if not video_path:
             continue
 
-        duration_frames = int(scene.duration * fps)
+        # 使用实际视频时长
+        actual_dur = _get_media_duration(video_path) or scene.duration
+        duration_frames = int(actual_dur * fps)
         src_in = _frames_to_tc(0, fps)
         src_out = _frames_to_tc(duration_frames, fps)
         rec_in = _frames_to_tc(current_tc, fps)
@@ -209,6 +292,7 @@ def _generate_edl_fallback(
 
         edl_lines.append(f"{i:03d}  AX       V     C        {src_in} {src_out} {rec_in} {rec_out}")
         edl_lines.append(f"* FROM CLIP NAME: {os.path.basename(video_path)}")
+        edl_lines.append(f"* SCENE {scene.scene_id}: {scene.voiceover[:50] if scene.voiceover else ''}")
         edl_lines.append("")
 
         current_tc += duration_frames
@@ -216,55 +300,36 @@ def _generate_edl_fallback(
     with open(edl_path, "w", encoding="utf-8") as f:
         f.write("\n".join(edl_lines))
 
-    # 生成 JSON 工程描述（包含完整信息）
-    project_json = {
-        "project_name": project_name,
-        "title": script.title,
-        "topic": script.topic,
-        "total_duration": sum(s.duration for s in script.scenes),
-        "resolution": "1920x1080",
-        "fps": fps,
-        "scenes": []
-    }
+    # 生成分镜素材清单（v2.0 新增）
+    _generate_scene_manifest(script, video_clips, audio_clips, output_dir, project_name)
 
-    for scene in script.scenes:
-        project_json["scenes"].append({
-            "scene_id": scene.scene_id,
-            "duration": scene.duration,
-            "voiceover": scene.voiceover,
-            "video_clip": video_clips.get(scene.scene_id, ""),
-            "audio_clip": audio_clips.get(scene.scene_id, ""),
-            "transition": scene.transition,
-            "image_prompt": scene.image_prompt,
-            "video_prompt": scene.video_prompt,
-        })
-
-    json_path = os.path.join(output_dir, f"{project_name}_project.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(project_json, f, ensure_ascii=False, indent=2)
-
-    # 生成 SRT 字幕文件（独立文件，方便导入）
+    # 生成 SRT 字幕文件
     srt_path = os.path.join(output_dir, f"{project_name}.srt")
     _generate_srt_file(script.scenes, audio_clips, srt_path)
 
     # 生成操作说明
     readme_path = os.path.join(output_dir, "导入说明.txt")
     with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(f"""噼哩噼哩 - {project_name} 工程文件
+        f.write(f"""噼哩噼哩 v2.0 - {project_name} 工程文件（分轨模式）
 
 生成时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-文件说明：
-- {project_name}.edl      → 可导入 Premiere Pro / DaVinci Resolve
-- {project_name}.srt      → 字幕文件，可在剪辑软件中导入
-- {project_name}_project.json → 完整工程描述，包含所有分镜信息
+【v2.0 重要更新】
+本次导出为"分轨模式"：每个分镜作为独立片段，可在剪映中单独替换！
+不再导入合并后的成片，而是导入所有原始分镜素材。
 
-导入剪映步骤：
-1. 打开剪映专业版
-2. 新建项目（1920x1080，30fps）
-3. 将所有视频片段按顺序导入素材库
-4. 参考 _project.json 中的顺序和时长手动排列
-5. 导入 .srt 字幕文件
+文件说明：
+- {project_name}.edl              → 可导入 Premiere Pro / DaVinci Resolve
+- {project_name}.srt              → 字幕文件，可在剪映中导入
+- {project_name}_manifest.json    → 分镜素材清单（含每个分镜的路径、时长、提示词）
+
+导入剪映步骤（分轨模式）：
+1. 打开剪映专业版，新建项目（1920x1080，30fps）
+2. 将所有视频片段（scene_001_clip.mp4 等）导入素材库
+3. 按 manifest.json 中的顺序，将视频片段拖到主轨道
+4. 将对应的配音文件拖到音频轨道（与视频对齐）
+5. 导入 .srt 字幕文件到字幕轨道
+6. 如需替换某个分镜：在素材库中替换对应片段即可
 
 导入 Premiere Pro 步骤：
 1. 新建序列（1920x1080，30fps）
@@ -272,11 +337,11 @@ def _generate_edl_fallback(
 3. 将素材文件夹指定为视频片段所在目录
 
 总时长：{sum(s.duration for s in script.scenes):.1f} 秒
-分镜数：{len(script.scenes)} 个
+分镜数：{len(script.scenes)} 个（每个独立可编辑）
 """)
 
     if verbose:
-        print(f"[JianyingDraft] 工程文件已生成: {output_dir}")
+        print(f"[JianyingDraft] v2.0 EDL 工程文件已生成: {output_dir}")
 
     return output_dir
 
@@ -297,20 +362,21 @@ def _generate_srt_file(
     output_path: str,
 ) -> None:
     """生成 SRT 字幕文件"""
-    from modules.tts import get_audio_duration
-
     srt_lines = []
     current_time = 0.0
     index = 1
 
     for scene in scenes:
         if not scene.voiceover.strip():
-            current_time += scene.duration
+            # 没有旁白的分镜，时间轴仍然推进
+            video_dur = scene.duration
+            current_time += video_dur
             continue
 
+        # 字幕时长优先使用音频实际时长
         audio_path = audio_clips.get(scene.scene_id, "")
         if audio_path and os.path.exists(audio_path):
-            duration = get_audio_duration(audio_path)
+            duration = _get_media_duration(audio_path) or scene.duration
         else:
             duration = scene.duration
 

@@ -32,7 +32,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config import get_config, PilipiliConfig, get_active_llm_config, reset_config, CONFIG_SEARCH_PATHS
-from modules.llm import generate_script_sync, VideoScript, Scene, script_to_dict
+from modules.llm import generate_script_sync, VideoScript, Scene, script_to_dict, analyze_reference_video_sync, ReferenceVideoAnalysis
 from modules.image_gen import generate_all_keyframes_sync
 from modules.tts import generate_all_voiceovers_sync, update_scene_durations
 from modules.video_gen import generate_all_video_clips_sync, _generate_kling_jwt
@@ -170,11 +170,13 @@ class ReviewDecisionRequest(BaseModel):
 
 
 # ============================================================
-# 文件上传 API（角色参考图）
+# 文件上传 API（角色参考图 + 对标视频）
 # ============================================================
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "uploads", "references")
+VIDEO_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "uploads", "reference_videos")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(VIDEO_UPLOAD_DIR, exist_ok=True)
 
 
 def _extract_frame_from_video(video_path: str, output_path: str) -> str:
@@ -841,6 +843,256 @@ async def test_api_key(request: TestKeyRequest):
 
     except Exception as e:
         return {"success": False, "message": f"连接失败: {type(e).__name__}: {str(e)}"}
+
+
+# ============================================================
+# 对标视频分析 API（P1 新增）
+# ============================================================
+
+# 内存缓存：对标视频分析结果（project_id → analysis）
+_reference_analyses: dict[str, dict] = {}
+
+
+def _analysis_to_dict(analysis: ReferenceVideoAnalysis) -> dict:
+    """将 ReferenceVideoAnalysis 转为可序列化字典"""
+    return {
+        "title": analysis.title,
+        "style": analysis.style,
+        "aspect_ratio": analysis.aspect_ratio,
+        "total_duration": analysis.total_duration,
+        "bgm_style": analysis.bgm_style,
+        "color_grade": analysis.color_grade,
+        "overall_prompt": analysis.overall_prompt,
+        "characters": [
+            {
+                "character_id": c.character_id,
+                "name": c.name,
+                "description": c.description,
+                "appearance_prompt": c.appearance_prompt,
+                "replacement_image": c.replacement_image,
+            }
+            for c in analysis.characters
+        ],
+        "scenes": [
+            {
+                "scene_id": s.scene_id,
+                "duration": s.duration,
+                "image_prompt": s.image_prompt,
+                "video_prompt": s.video_prompt,
+                "voiceover": s.voiceover,
+                "shot_mode": s.shot_mode,
+                "transition": s.transition,
+                "camera_motion": s.camera_motion,
+                "style_tags": s.style_tags,
+            }
+            for s in analysis.scenes
+        ],
+        "reverse_prompts": analysis.reverse_prompts,
+        "raw_analysis": analysis.raw_analysis,
+    }
+
+
+@app.post("/api/analyze/upload")
+async def analyze_reference_video_upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """
+    上传对标视频文件，触发 Gemini 分析
+
+    分析结果包含：
+    - 人物列表（外貌描述 + 英文提示词）
+    - 分镜结构（含 shot_mode 标注）
+    - 每个分镜的反推提示词（reverse_prompt）
+    - 整体风格提示词
+
+    返回 analysis_id，前端通过 GET /api/analyze/{analysis_id} 轮询结果
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名为空")
+
+    ext = Path(file.filename).suffix.lower()
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv"}
+    if ext not in video_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式: {ext}。支持的视频格式: {', '.join(video_exts)}"
+        )
+
+    # 保存上传文件
+    analysis_id = uuid.uuid4().hex[:12]
+    save_path = os.path.join(VIDEO_UPLOAD_DIR, f"{analysis_id}{ext}")
+
+    with open(save_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    # 初始化分析状态
+    _reference_analyses[analysis_id] = {
+        "analysis_id": analysis_id,
+        "status": "processing",
+        "filename": file.filename,
+        "file_path": save_path,
+        "created_at": datetime.now().isoformat(),
+        "result": None,
+        "error": None,
+    }
+
+    # 后台异步执行分析
+    background_tasks.add_task(_run_reference_analysis, analysis_id, save_path)
+
+    return {
+        "analysis_id": analysis_id,
+        "status": "processing",
+        "message": "视频已上传，正在分析中..."
+    }
+
+
+async def _run_reference_analysis(analysis_id: str, video_path: str):
+    """后台任务：执行对标视频分析"""
+    try:
+        config = get_config()
+        analysis = await __import__('asyncio').get_event_loop().run_in_executor(
+            None,
+            lambda: analyze_reference_video_sync(video_path, config, verbose=True)
+        )
+        _reference_analyses[analysis_id]["status"] = "completed"
+        _reference_analyses[analysis_id]["result"] = _analysis_to_dict(analysis)
+    except Exception as e:
+        import traceback
+        _reference_analyses[analysis_id]["status"] = "failed"
+        _reference_analyses[analysis_id]["error"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+
+
+@app.get("/api/analyze/{analysis_id}")
+async def get_reference_analysis(analysis_id: str):
+    """
+    获取对标视频分析结果
+
+    status 字段：
+    - processing：分析中
+    - completed：分析完成，result 字段包含完整结果
+    - failed：分析失败，error 字段包含错误信息
+    """
+    if analysis_id not in _reference_analyses:
+        raise HTTPException(status_code=404, detail="分析任务不存在")
+    return _reference_analyses[analysis_id]
+
+
+@app.post("/api/analyze/{analysis_id}/replace-character")
+async def replace_character(
+    analysis_id: str,
+    character_id: int = Form(...),
+    file: UploadFile = File(...),
+):
+    """
+    为对标视频中的某个人物上传替换参考图
+
+    上传后，该人物的 replacement_image 字段将被更新。
+    创建新项目时可以将此路径传入 reference_images，
+    实现人物替换（用用户上传的人物替换对标视频中的原始人物）。
+    """
+    if analysis_id not in _reference_analyses:
+        raise HTTPException(status_code=404, detail="分析任务不存在")
+
+    analysis_data = _reference_analyses[analysis_id]
+    if analysis_data["status"] != "completed" or not analysis_data.get("result"):
+        raise HTTPException(status_code=400, detail="分析尚未完成")
+
+    ext = Path(file.filename).suffix.lower()
+    image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+    unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
+    save_path = os.path.join(UPLOAD_DIR, unique_name)
+
+    with open(save_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    # 如果是视频，提取帧
+    if ext in video_exts:
+        frame_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex[:12]}_frame.jpg")
+        try:
+            _extract_frame_from_video(save_path, frame_path)
+            os.remove(save_path)
+            save_path = frame_path
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"视频截帧失败: {str(e)}")
+
+    # 更新人物的 replacement_image
+    characters = analysis_data["result"]["characters"]
+    for char in characters:
+        if char["character_id"] == character_id:
+            char["replacement_image"] = os.path.abspath(save_path)
+            return {
+                "message": f"人物 {char['name']} 的替换参考图已更新",
+                "character_id": character_id,
+                "replacement_image": os.path.abspath(save_path),
+                "path": os.path.abspath(save_path),
+            }
+
+    raise HTTPException(status_code=404, detail=f"人物 ID {character_id} 不存在")
+
+
+@app.post("/api/analyze/{analysis_id}/create-project")
+async def create_project_from_analysis(
+    analysis_id: str,
+    background_tasks: BackgroundTasks,
+    topic: Optional[str] = Form(None),
+    video_engine: Optional[str] = Form("kling"),
+    add_subtitles: bool = Form(True),
+):
+    """
+    基于对标视频分析结果直接创建新项目
+
+    自动将分析出的：
+    - 整体风格提示词作为 style
+    - 人物替换参考图作为 reference_images
+    - 分镜结构作为脚本初稿（跳过 LLM 生成，直接进入审核关卡）
+    """
+    if analysis_id not in _reference_analyses:
+        raise HTTPException(status_code=404, detail="分析任务不存在")
+
+    analysis_data = _reference_analyses[analysis_id]
+    if analysis_data["status"] != "completed" or not analysis_data.get("result"):
+        raise HTTPException(status_code=400, detail="分析尚未完成")
+
+    result = analysis_data["result"]
+
+    # 收集替换参考图
+    reference_images = []
+    for char in result["characters"]:
+        if char.get("replacement_image") and os.path.exists(char["replacement_image"]):
+            reference_images.append(char["replacement_image"])
+
+    # 构建创建请求
+    req = CreateProjectRequest(
+        topic=topic or result["title"],
+        style=result.get("overall_prompt", result.get("style", "")),
+        video_engine=video_engine or "kling",
+        reference_images=reference_images,
+        add_subtitles=add_subtitles,
+    )
+
+    project_id = str(uuid.uuid4())[:8]
+    _projects[project_id] = {
+        "id": project_id,
+        "topic": req.topic,
+        "created_at": datetime.now().isoformat(),
+        "status": {"stage": WorkflowStage.IDLE.value, "progress": 0},
+        "script": None,
+        "result": None,
+        "from_analysis": analysis_id,
+    }
+
+    background_tasks.add_task(run_workflow, project_id, req)
+
+    return {
+        "project_id": project_id,
+        "message": "已基于对标视频分析创建新项目，工作流已启动",
+        "reference_images_count": len(reference_images),
+    }
 
 
 @app.post("/api/projects/{project_id}/feedback")
