@@ -131,14 +131,40 @@ async def generate_keyframe(
     # 添加主提示词
     contents.append(types.Part.from_text(text=full_prompt))
 
-    # 调用 API
-    response = client.models.generate_content(
-        model=config.image_gen.model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-        )
-    )
+    # 调用 API，503 时自动切换备用模型
+    FALLBACK_MODELS = [
+        config.image_gen.model,
+        "models/gemini-2.5-flash-image",
+        "models/gemini-3.1-flash-image-preview",
+    ]
+    # 去重保序
+    seen = set()
+    model_list = [m for m in FALLBACK_MODELS if not (m in seen or seen.add(m))]
+
+    last_err = None
+    response = None
+    for model_name in model_list:
+        try:
+            if verbose and model_name != config.image_gen.model:
+                print(f"[ImageGen] 主模型不可用，切换到备用模型: {model_name}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                )
+            )
+            break  # 成功则退出循环
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                if verbose:
+                    print(f"[ImageGen] 模型 {model_name} 不可用 ({err_str[:60]})，尝试下一个...")
+                continue
+            raise  # 其他错误直接抛出
+    if response is None:
+        raise RuntimeError(f"Scene {scene.scene_id} 所有图像模型均不可用: {last_err}")
 
     # 提取图片数据
     image_saved = False
