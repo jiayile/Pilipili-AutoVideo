@@ -3,7 +3,7 @@
 图像生成模块 - Nano Banana (Gemini Image Generation)
 
 职责：
-- 为每个分镜生成高质量 4K 首帧关键图
+- 为每个分镜生成高质量 1080P 首帧关键图
 - 支持多参考图注入（角色一致性）
 - 支持风格参考图
 - 异步并发生成，提升效率
@@ -106,7 +106,7 @@ async def generate_keyframe(
     # 添加质量提示词
     full_prompt = (
         f"{full_prompt}, "
-        f"ultra high quality, 4K resolution, cinematic composition, "
+        f"ultra high quality, 1080P resolution, cinematic composition, "
         f"professional photography, sharp focus, detailed"
     )
 
@@ -487,7 +487,7 @@ def _make_safe_prompt(scene: Scene) -> str:
     safe = (
         f"A beautiful cinematic scene: {prompt[:200]}. "
         f"No people, focus on environment and atmosphere. "
-        f"Ultra high quality, 4K resolution, cinematic composition."
+        f"Ultra high quality, 1080P resolution, cinematic composition."
     )
     return safe
 
