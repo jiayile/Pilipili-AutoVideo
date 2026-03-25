@@ -216,6 +216,7 @@ class CreateProjectRequest(BaseModel):
     auto_publish: bool = False
     preset_scenes: Optional[list[dict]] = None   # 对标分析分镜（有则跳过 LLM 生成）
     preset_title: Optional[str] = None           # 对标分析标题
+    resolution: Optional[str] = "1080p"          # 输出分辨率："720p" / "1080p" / "4K"
 
 
 class ReviewDecisionRequest(BaseModel):
@@ -589,6 +590,7 @@ async def run_workflow(project_id: str, request: CreateProjectRequest):
             auto_route=auto_route,
             config=config,
             verbose=True,
+            resolution=request.resolution or "1080p",
         )
 
         await push_status(project_id, WorkflowStage.ASSEMBLING, 80,
@@ -914,6 +916,7 @@ async def run_resume_workflow(project_id: str, video_engine: str = "kling", add_
             auto_route=auto_route,
             config=config,
             verbose=True,
+            resolution=request.resolution or "1080p",
         )
 
         await push_status(project_id, WorkflowStage.ASSEMBLING, 80,

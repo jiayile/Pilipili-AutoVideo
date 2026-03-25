@@ -413,6 +413,7 @@ async def _submit_kling_i2v(
     scene: Scene,
     config: PilipiliConfig,
     session: aiohttp.ClientSession,
+    resolution: Optional[str] = None,
 ) -> str:
     """提交 Kling v3 I2V 任务，返回 task_id（旧版接口，作为 Omni 回退）"""
     api_key = config.video_gen.kling.api_key
@@ -425,8 +426,10 @@ async def _submit_kling_i2v(
     img_b64 = _image_to_base64(image_path)
 
     duration = 5 if scene.duration <= 7 else 10
-    quality = config.video_gen.kling.default_quality or "high"
-    resolution = "1080p" if quality == "high" else "720p"
+    # 优先使用传入的 resolution，否则从配置推导
+    if resolution is None:
+        quality = config.video_gen.kling.default_quality or "high"
+        resolution = "1080p" if quality == "high" else "720p"
 
     payload = {
         "model_name": config.video_gen.kling.model or "kling-v3",
@@ -711,6 +714,7 @@ async def generate_video_clips_omni_batch(
     reference_images: Optional[list[str]] = None,
     batch_size: int = 6,
     verbose: bool = False,
+    resolution: Optional[str] = None,
 ) -> dict[int, str]:
     """
     使用 Kling Omni 多镜头模式批量生成视频片段
@@ -807,6 +811,7 @@ async def generate_all_video_clips(
     verbose: bool = False,
     reference_images: Optional[list[str]] = None,
     use_omni_batch: bool = True,
+    resolution: Optional[str] = None,
 ) -> dict[int, str]:
     """
     生成所有分镜的视频片段
@@ -841,6 +846,7 @@ async def generate_all_video_clips(
             config=config,
             reference_images=reference_images,
             verbose=verbose,
+            resolution=resolution,
         )
 
     # 回退到逐个生成模式（并发）
@@ -885,6 +891,7 @@ def generate_all_video_clips_sync(
     verbose: bool = False,
     reference_images: Optional[list[str]] = None,
     use_omni_batch: bool = True,
+    resolution: Optional[str] = None,
 ) -> dict[int, str]:
     """generate_all_video_clips 的同步版本"""
     return asyncio.run(generate_all_video_clips(
@@ -898,4 +905,5 @@ def generate_all_video_clips_sync(
         verbose=verbose,
         reference_images=reference_images,
         use_omni_batch=use_omni_batch,
+        resolution=resolution,
     ))
