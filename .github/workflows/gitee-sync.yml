@@ -1,0 +1,20 @@
+name: Sync to Gitee
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync to Gitee
+        uses: wearerequired/git-mirror-action@v1
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITEE_RSA_PRIVATE_KEY: ${{ secrets.GITEE_RSA_PRIVATE_KEY }}
+        with:
+          source-repo: "git@github.com:jiayile/Pilipili-AutoVideo.git"
+          destination-repo: "git@gitee.com:jiayile/Pilipili-AutoVideo.git"
