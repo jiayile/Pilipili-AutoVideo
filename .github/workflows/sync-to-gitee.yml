@@ -14,9 +14,16 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GITEE_RSA_PRIVATE_KEY }}" | base64 -d > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -t rsa gitee.com >> ~/.ssh/known_hosts 2>/dev/null
+
       - name: Push to Gitee
         env:
           GITEE_REPO: ${{ github.event.repository.name }}
         run: |
-          git remote add gitee "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/${GITEE_USERNAME}/${GITEE_REPO}.git"
+          git remote add gitee "git@gitee.com:${{ secrets.GITEE_USERNAME }}/${GITEE_REPO}.git"
           git push gitee --mirror
